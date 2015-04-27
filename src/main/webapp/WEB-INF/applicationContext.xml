@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+    xmlns:amq="http://activemq.apache.org/schema/core"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:jaxrs="http://cxf.apache.org/jaxrs"
+	xmlns:cxf="http://camel.apache.org/schema/cxf" xmlns:context="http://www.springframework.org/schema/context"
+	xsi:schemaLocation="
+       http://www.springframework.org/schema/beans 
+       http://www.springframework.org/schema/beans/spring-beans-3.0.xsd
+       http://www.springframework.org/schema/context 
+       http://www.springframework.org/schema/context/spring-context-3.0.xsd
+       http://cxf.apache.org/jaxrs http://cxf.apache.org/schemas/jaxrs.xsd
+       http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd
+       http://camel.apache.org/schema/cxf http://camel.apache.org/schema/cxf/camel-cxf.xsd
+       http://activemq.apache.org/schema/core http://activemq.apache.org/schema/core/activemq-core.xsd">
+
+	<import resource="classpath:META-INF/cxf/cxf.xml" />
+	<import resource="classpath:META-INF/cxf/cxf-servlet.xml" />
+
+    <context:property-placeholder location='classpath:app.properties'/>
+
+    <!-- server endpoint to create the cxf-rs consumer -->
+	<cxf:rsServer id="rsServer" address="/"
+		serviceClass="com.windmilled.app.QueueService" loggingFeatureEnabled="true" loggingSizeLimit="100" />
+
+    <!-- camel routes -->
+	<camelContext xmlns="http://camel.apache.org/schema/spring" trace="true">
+
+		<!-- Handling addition requests.
+            User requests are routed by REST operation from QueueService -->
+		<route>
+			<from uri="cxfrs:bean:rsServer?bindingStyle=SimpleConsumer" />
+			<choice>
+				<when>
+					<simple>${header.operationName} == 'ping'</simple>
+					<setBody><constant>I'm alive</constant></setBody>
+				</when>
+				<when>
+					<!-- Get data -->
+					<simple>${header.operationName} == 'getMessage'</simple>
+					<setHeader headerName="CamelCacheOperation">
+                        <constant>CamelCacheGet</constant>
+                    </setHeader>
+                    <setHeader headerName="CamelCacheKey">
+                        <constant>general</constant>
+                    </setHeader>
+                    <!-- Get general data -->
+                    <to uri="cache://messagesCache?eternal=true&amp;diskPersistent=true&amp;maxElementsInMemory=1000"/>
+					<choice>
+						<when>
+							<simple>${header.store} != 'general'</simple>
+							<setHeader headerName="CamelCacheOperation">
+                        		<constant>CamelCacheGet</constant>
+                    		</setHeader>                    
+							<setHeader headerName="CamelCacheKey">
+                        		<simple>${header.store}</simple>
+                    		</setHeader>
+                            <!-- Enrich with specific data -->
+                    		<pollEnrich uri="cache://messagesCache?eternal=true&amp;diskPersistent=true&amp;maxElementsInMemory=1000"
+	                    		strategyRef="appendAggregationStrategy"/>
+						</when>
+                    </choice>
+				</when>
+				<when>
+					<!-- Upload data -->
+					<simple>${header.operationName} == 'uploadMessage'</simple>
+                    <recipientList>
+                     	<simple>activemq:queue:incoming?exchangePattern=InOnly&amp;transacted=true</simple>
+                    </recipientList>
+				</when>				
+			</choice>			        
+		</route>
+		
+		<!-- Cache updating (addition queues).
+		    Camel and ActiveMQ have wildcard support, so this one route means data flow for each queue. -->
+        <route>
+            <from uri="activemq:queue:incoming"/>
+            <setHeader headerName="CamelCacheOperation">
+                <constant>CamelCacheUpdate</constant>
+            </setHeader>
+            <setHeader headerName="CamelCacheKey">
+                <simple>${header.store}</simple>
+            </setHeader>
+            <to uri="cache://messagesCache?eternal=true&amp;diskPersistent=true&amp;maxElementsInMemory=1000"/>
+        </route>
+
+        <!-- Cache updating (origin queue). -->
+        <route>
+            <from uri="activemq:queue:general"/>
+            <setHeader headerName="CamelCacheOperation">
+                <constant>CamelCacheUpdate</constant>
+            </setHeader>
+            <setHeader headerName="CamelCacheKey">
+                <constant>general</constant>
+            </setHeader>
+            <to uri="cache://messagesCache?eternal=true&amp;diskPersistent=true&amp;maxElementsInMemory=1000"/>
+        </route>
+	</camelContext>
+	
+	<!-- beans -->
+	<bean id="appendAggregationStrategy" class="com.windmilled.app.camel.AppendAggregationStrategy" />
+
+    <!-- activemq broker -->
+    <broker useJmx="true" xmlns="http://activemq.apache.org/schema/core">
+        <transportConnectors>
+            <transportConnector uri="tcp://localhost:61616" />
+        </transportConnectors>
+    </broker>
+
+    <bean id="jmsConnectionFactory"
+          class="org.apache.activemq.ActiveMQConnectionFactory">
+        <property name="brokerURL" value="tcp://${activemq.host}:${activemq.post}" />
+    </bean>
+
+    <bean id="pooledConnectionFactory"
+          class="org.apache.activemq.pool.PooledConnectionFactory" init-method="start" destroy-method="stop">
+        <property name="maxConnections" value="8" />
+        <property name="connectionFactory" ref="jmsConnectionFactory" />
+    </bean>
+
+    <!-- JMS configuration: enable persistent delivery -->
+    <bean id="jmsConfig"
+          class="org.apache.camel.component.jms.JmsConfiguration">
+        <property name="connectionFactory" ref="pooledConnectionFactory"/>
+        <property name="concurrentConsumers" value="10"/>
+        <property name="deliveryPersistent" value="true"/>
+    </bean>
+
+    <bean id="activemq" class="org.apache.activemq.camel.component.ActiveMQComponent">
+        <property name="configuration" ref="jmsConfig"/>
+    </bean>
+
+</beans>
